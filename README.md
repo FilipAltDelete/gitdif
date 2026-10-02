@@ -103,8 +103,13 @@ Press `?` inside gitdif for this list, or `<Space>` for the leader menu.
 |---|---|
 | `Enter`, `l`, `zo` | open the hidden-lines row under the cursor |
 | mouse click | open the hidden-lines row clicked |
-| `zR` / `zM` | open / close all |
+| `Ctrl+Enter` | open all hidden lines in the current file |
+| `zR` / `zM` | open / close all hidden lines in every open file |
 | `+` / `-` | more / less context around changes |
+
+`Ctrl+Enter` needs a terminal with the kitty keyboard protocol (foot, kitty,
+Alacritty, Ghostty, WezTerm). Elsewhere, including inside tmux, it arrives as a
+plain `Enter`, so use `zR` instead.
 
 ### Buffers (tabs) and explorer
 

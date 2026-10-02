@@ -12,9 +12,11 @@ use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    terminal::supports_keyboard_enhancement,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -977,6 +979,15 @@ impl App {
         opened
     }
 
+    fn open_all_folds(&mut self) {
+        let (edge, ctx) = (self.cfg.edge, self.cfg.ctx);
+        if let Some(b) = self.bufs.get_mut(self.cur) {
+            b.opened.iter_mut().for_each(|v| *v = true);
+            b.rebuild(edge, ctx);
+            self.msg = "all folds in this file opened".into();
+        }
+    }
+
     fn tree_key(&mut self, k: KeyEvent) {
         use KeyCode::*;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1003,7 +1014,11 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let h = self.editor_h().max(1) as isize;
         if matches!(k.code, Enter) {
-            self.open_fold();
+            if ctrl {
+                self.open_all_folds();
+            } else {
+                self.open_fold();
+            }
             return;
         }
         // like vim's 'foldopen' "hor": moving right on a fold opens it
@@ -1397,6 +1412,7 @@ impl App {
             ("h / l / 0", "scroll left / right / reset"),
             ("Enter / l / zo", "open fold under cursor"),
             ("mouse click", "open fold / move cursor"),
+            ("C-Enter", "open all folds in this file"),
             ("zR / zM", "open / close all folds"),
             ("+ / -", "more / less context around changes"),
             ("H / L   [b / ]b", "previous / next buffer"),
@@ -1584,7 +1600,19 @@ fn real_main() -> Result<()> {
     let mut app = App::new(cfg)?;
     let mut term = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture)?;
+    // Kitty keyboard protocol, so keys like Ctrl+Enter are distinguishable
+    // from their plain versions.
+    let kitty_keys = supports_keyboard_enhancement().unwrap_or(false);
+    if kitty_keys {
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     let res = run(&mut app, &mut term);
+    if kitty_keys {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
