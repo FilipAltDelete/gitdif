@@ -653,6 +653,9 @@ struct App {
     quit: bool,
     tree_rect: Rect,
     editor_rect: Rect,
+    bufline_rect: Rect,
+    /// Screen columns covered by each buffer tab, indexed like `bufs`.
+    tab_cols: Vec<std::ops::Range<u16>>,
 }
 
 impl App {
@@ -712,6 +715,8 @@ impl App {
             quit: false,
             tree_rect: Rect::default(),
             editor_rect: Rect::default(),
+            bufline_rect: Rect::default(),
+            tab_cols: Vec::new(),
         };
         app.reload_files(rel.as_deref());
         match rel {
@@ -808,10 +813,17 @@ impl App {
     }
 
     fn close_buf(&mut self) {
-        if self.bufs.is_empty() {
+        self.close_buf_at(self.cur);
+    }
+
+    fn close_buf_at(&mut self, i: usize) {
+        if i >= self.bufs.len() {
             return;
         }
-        self.bufs.remove(self.cur);
+        self.bufs.remove(i);
+        if i < self.cur {
+            self.cur -= 1;
+        }
         self.cur = self.cur.min(self.bufs.len().saturating_sub(1));
         if self.bufs.is_empty() {
             self.focus = Focus::Tree;
@@ -889,13 +901,16 @@ impl App {
                     self.rebuild_all();
                     self.msg = "all folds closed".into();
                 }
-                ('z', Char('o' | 'a')) => self.open_fold(),
+                ('z', Char('o' | 'a')) => {
+                    self.open_fold();
+                }
                 _ => {}
             }
             return;
         }
         match k.code {
             Char('c') if ctrl => self.quit = true,
+            Char('w') if ctrl => self.close_buf(),
             Char('h') if ctrl => {
                 if self.show_tree {
                     self.focus = Focus::Tree
@@ -953,19 +968,22 @@ impl App {
         }
     }
 
-    fn open_fold(&mut self) {
+    fn open_fold(&mut self) -> bool {
         let (edge, ctx) = (self.cfg.edge, self.cfg.ctx);
-        if let Some(b) = self.bufs.get_mut(self.cur) {
-            if b.open_fold(edge, ctx) {
-                self.msg = "fold opened".into();
-            }
+        let opened = self.bufs.get_mut(self.cur).is_some_and(|b| b.open_fold(edge, ctx));
+        if opened {
+            self.msg = "fold opened".into();
         }
+        opened
     }
 
     fn tree_key(&mut self, k: KeyEvent) {
         use KeyCode::*;
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let n = self.tree.len();
         match k.code {
+            Char('j') if ctrl => self.tree_sel = (self.tree_sel + 10).min(n.saturating_sub(1)),
+            Char('k') if ctrl => self.tree_sel = self.tree_sel.saturating_sub(10),
             Char('j') | Down => self.tree_sel = (self.tree_sel + 1).min(n.saturating_sub(1)),
             Char('k') | Up => self.tree_sel = self.tree_sel.saturating_sub(1),
             Char('G') | End => self.tree_sel = n.saturating_sub(1),
@@ -988,6 +1006,10 @@ impl App {
             self.open_fold();
             return;
         }
+        // like vim's 'foldopen' "hor": moving right on a fold opens it
+        if matches!(k.code, Char('l') | Right) && self.open_fold() {
+            return;
+        }
         match k.code {
             Char('n') => return self.goto_change(true),
             Char('N') => return self.goto_change(false),
@@ -995,6 +1017,8 @@ impl App {
         }
         let Some(b) = self.bufs.get_mut(self.cur) else { return };
         match k.code {
+            Char('j') if ctrl => b.move_by(10),
+            Char('k') if ctrl => b.move_by(-10),
             Char('j') | Down => b.move_by(1),
             Char('k') | Up => b.move_by(-1),
             Char('d') if ctrl => b.move_by(h / 2),
@@ -1042,11 +1066,17 @@ impl App {
                 } else if in_editor {
                     if let Some(b) = self.bufs.get_mut(self.cur) {
                         let i = b.scroll + (m.row - self.editor_rect.y) as usize;
+                        self.focus = Focus::Editor;
                         if i < b.rows.len() {
                             b.cursor = i;
+                            self.open_fold();
                         }
-                        self.focus = Focus::Editor;
                     }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if self.bufline_rect.contains(pos) => {
+                if let Some(i) = self.tab_cols.iter().position(|r| r.contains(&m.column)) {
+                    self.close_buf_at(i);
                 }
             }
             _ => {}
@@ -1070,6 +1100,7 @@ impl App {
             Layout::horizontal([Constraint::Length(tree_w), Constraint::Fill(1)]).areas(mid);
         self.tree_rect = tree_a;
         self.editor_rect = ed_a;
+        self.bufline_rect = top;
 
         self.draw_bufferline(f, top, tree_w);
         if self.show_tree {
@@ -1086,8 +1117,10 @@ impl App {
         }
     }
 
-    fn draw_bufferline(&self, f: &mut Frame, a: Rect, tree_w: u16) {
+    fn draw_bufferline(&mut self, f: &mut Frame, a: Rect, tree_w: u16) {
         let mut spans = Vec::new();
+        let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>() as u16;
+        self.tab_cols.clear();
         if tree_w > 0 {
             let title = format!("\u{f07c}  Explorer");
             let pad = (tree_w as usize).saturating_sub(title.chars().count()) / 2;
@@ -1098,6 +1131,7 @@ impl App {
             ));
         }
         for (i, b) in self.bufs.iter().enumerate() {
+            let x0 = a.x + width(&spans);
             let name = b.rel.rsplit('/').next().unwrap_or(&b.rel);
             let (icon, ic) = file_icon(name);
             let active = i == self.cur;
@@ -1117,6 +1151,7 @@ impl App {
                 spans.push(Span::styled(" ●", Style::new().bg(bg).fg(if active { YELLOW } else { DARK3 })));
             }
             spans.push(Span::styled("  ", Style::new().bg(bg)));
+            self.tab_cols.push(x0..(a.x + width(&spans)).min(a.right()));
         }
         f.render_widget(Line::from(spans).style(Style::new().bg(BG_DARK)), a);
     }
@@ -1303,7 +1338,7 @@ impl App {
     fn draw_cmdline(&self, f: &mut Frame, a: Rect) {
         let msg = if self.msg.is_empty() {
             Span::styled(
-                "]h/[h next/prev change · <Enter> open fold · +/- context · <Space>e explorer · ? help",
+                "]h/[h next/prev change · <Enter>/l/click open fold · +/- context · <Space>e explorer · ? help",
                 Style::new().fg(DARK3),
             )
         } else {
@@ -1355,17 +1390,20 @@ impl App {
     fn draw_help(&self, f: &mut Frame, area: Rect) {
         let keys: &[(&str, &str)] = &[
             ("j / k", "move down / up"),
+            ("C-j / C-k", "move 10 lines down / up"),
             ("C-d / C-u", "half page down / up"),
             ("gg / G", "top / bottom"),
             ("]h / [h   n / N", "next / previous change"),
             ("h / l / 0", "scroll left / right / reset"),
-            ("Enter / zo", "open fold under cursor"),
+            ("Enter / l / zo", "open fold under cursor"),
+            ("mouse click", "open fold / move cursor"),
             ("zR / zM", "open / close all folds"),
             ("+ / -", "more / less context around changes"),
             ("H / L   [b / ]b", "previous / next buffer"),
             ("Tab  C-h / C-l", "switch explorer / editor"),
             ("<Space>e", "toggle explorer"),
-            ("<Space>x", "close buffer"),
+            ("<Space>x / C-w", "close buffer"),
+            ("right-click tab", "close that buffer"),
             ("R", "refresh git state"),
             ("q", "quit"),
         ];

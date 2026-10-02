@@ -38,7 +38,20 @@ if [[ ! -w "$target" ]]; then
     SUDO="sudo"
 fi
 
+# A copy from `cargo install --path .` lands in ~/.cargo/bin, which usually
+# comes earlier in PATH and would keep running instead of this one.
+remove_cargo_copy() {
+    command -v cargo >/dev/null || return 0
+    if cargo install --list 2>/dev/null | grep "^$BIN_NAME " >/dev/null; then
+        cargo uninstall "$BIN_NAME"
+        echo "Removed the cargo-installed copy of $BIN_NAME"
+        REMOVED_CARGO_COPY=1
+    fi
+}
+REMOVED_CARGO_COPY=0
+
 if [[ $UNINSTALL -eq 1 ]]; then
+    remove_cargo_copy
     if [[ -e "$DEST" ]]; then
         $SUDO rm -f "$DEST"
         echo "Removed $DEST"
@@ -59,6 +72,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 echo "Building $BIN_NAME (release)..."
 cargo build --release --locked
 
+remove_cargo_copy
 $SUDO install -d "$BIN_DIR"
 $SUDO install -m 755 "target/release/$BIN_NAME" "$DEST"
 echo "Installed $DEST"
@@ -68,3 +82,10 @@ case ":$PATH:" in
     *) echo "note: $BIN_DIR is not in your PATH. Add it, e.g.:"
        echo "    export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
+
+found="$(command -v "$BIN_NAME" || true)"
+if [[ -n "$found" && "$found" != "$DEST" ]]; then
+    echo "warning: '$BIN_NAME' in your PATH resolves to $found, not $DEST" >&2
+elif [[ $REMOVED_CARGO_COPY -eq 1 ]]; then
+    echo "note: run 'hash -r' (or open a new shell) if your shell still finds the old copy"
+fi
