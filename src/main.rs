@@ -164,11 +164,20 @@ fn git_batch(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Commit the index with `msg`, then push it. Progress is sent on `tx`; an
-/// `Err` means nothing was committed.
-fn commit_and_push(root: &Path, msg: &str, tx: &mpsc::Sender<Result<String>>) {
+/// Progress of a background commit & push.
+enum JobMsg {
+    /// Nothing was committed.
+    Failed(anyhow::Error),
+    /// The commit is made; the text says how the push is going.
+    Committed(String),
+    /// Committed and pushed, so gitdif is done.
+    Pushed(String),
+}
+
+/// Commit the index with `msg`, then push it. Progress is sent on `tx`.
+fn commit_and_push(root: &Path, msg: &str, tx: &mpsc::Sender<JobMsg>) {
     if let Err(e) = git_batch(root, &["commit", "-q", "-m", msg]) {
-        let _ = tx.send(Err(e));
+        let _ = tx.send(JobMsg::Failed(e));
         return;
     }
     let head = git(root, &["log", "-1", "--format=%h"]).unwrap_or_default();
@@ -181,15 +190,15 @@ fn commit_and_push(root: &Path, msg: &str, tx: &mpsc::Sender<Result<String>>) {
         // first push of this branch: set its upstream like `git push -u` does
         (Err(_), Some(r)) => (vec!["push", "-u", r, "HEAD"], format!("{r}/{}", branch(root))),
         (Err(_), None) => {
-            let _ = tx.send(Ok(format!("{head} · no remote to push to")));
+            let _ = tx.send(JobMsg::Committed(format!("{head} · no remote to push to")));
             return;
         }
     };
-    let _ = tx.send(Ok(format!("{head} · pushing to {target}…")));
-    let _ = tx.send(Ok(match git_batch(root, &args) {
-        Ok(()) => format!("{head} · pushed to {target}"),
-        Err(e) => format!("{head} · push failed: {e}"),
-    }));
+    let _ = tx.send(JobMsg::Committed(format!("{head} · pushing to {target}…")));
+    let _ = tx.send(match git_batch(root, &args) {
+        Ok(()) => JobMsg::Pushed(format!("{head} · pushed to {target}")),
+        Err(e) => JobMsg::Committed(format!("{head} · push failed: {e}")),
+    });
 }
 
 /// The empty tree, used as base in repositories without commits.
@@ -910,8 +919,10 @@ struct App {
     /// Commit message being typed; kept if the popup is closed or the commit fails.
     commit_msg: String,
     /// Progress of a running commit & push, closed when it is done.
-    job: Option<mpsc::Receiver<Result<String>>>,
+    job: Option<mpsc::Receiver<JobMsg>>,
     quit: bool,
+    /// Printed to the shell after quitting.
+    exit_msg: Option<String>,
     tree_rect: Rect,
     editor_rect: Rect,
     bufline_rect: Rect,
@@ -979,6 +990,7 @@ impl App {
             commit_msg: String::new(),
             job: None,
             quit: false,
+            exit_msg: None,
             tree_rect: Rect::default(),
             editor_rect: Rect::default(),
             bufline_rect: Rect::default(),
@@ -1386,27 +1398,34 @@ impl App {
         self.job = Some(rx);
     }
 
-    /// Show progress of a running commit & push; true if anything changed.
+    /// Show progress of a running commit & push, and quit once it is pushed;
+    /// true if anything changed.
     fn pump_job(&mut self) -> bool {
         let Some(rx) = &self.job else { return false };
-        let res = match rx.try_recv() {
-            Ok(res) => res,
+        let msg = match rx.try_recv() {
+            Ok(msg) => msg,
             Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.job = None;
                 return true;
             }
         };
-        if res.is_ok() {
-            self.commit_msg.clear();
-        }
+        let text = match msg {
+            JobMsg::Pushed(m) => {
+                self.exit_msg = Some(m);
+                self.quit = true;
+                return true;
+            }
+            JobMsg::Committed(m) => {
+                self.commit_msg.clear();
+                m
+            }
+            JobMsg::Failed(e) => format!("commit failed: {e}"),
+        };
         // the commit moved HEAD; on a first commit there is a base now
         self.base = resolve_base(&self.root, &self.cfg.base);
         self.refresh();
-        self.msg = match res {
-            Ok(m) => m,
-            Err(e) => format!("commit failed: {e}"),
-        };
+        self.msg = text;
         true
     }
 
@@ -2252,6 +2271,9 @@ fn real_main() -> Result<()> {
     }
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    if let Some(m) = &app.exit_msg {
+        println!("{m}");
+    }
     res
 }
 
