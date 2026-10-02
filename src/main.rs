@@ -3,9 +3,12 @@
 
 use std::{
     cmp::Ordering,
-    io::{self, IsTerminal, Write},
+    collections::{HashMap, HashSet},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +21,7 @@ use crossterm::{
     execute,
     terminal::supports_keyboard_enhancement,
 };
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout, Rect},
@@ -132,6 +136,62 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Like `git`, for commands that may run hooks or talk to a remote: no stdin,
+/// and credential / passphrase prompts fail instead of fighting the TUI for
+/// the terminal. Errors are squeezed onto one line for the message bar.
+fn git_batch(dir: &Path, args: &[&str]) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS_REQUIRE", "force");
+    if std::env::var_os("SSH_ASKPASS").is_none() {
+        cmd.env("SSH_ASKPASS", "false");
+    }
+    let out = cmd.output().context("failed to run git")?;
+    if !out.status.success() {
+        let text = if out.stderr.is_empty() { &out.stdout } else { &out.stderr };
+        let text = String::from_utf8_lossy(text);
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("hint:") && !l.starts_with("To "))
+            .collect();
+        bail!("{}", lines.join(" · "));
+    }
+    Ok(())
+}
+
+/// Commit the index with `msg`, then push it. Progress is sent on `tx`; an
+/// `Err` means nothing was committed.
+fn commit_and_push(root: &Path, msg: &str, tx: &mpsc::Sender<Result<String>>) {
+    if let Err(e) = git_batch(root, &["commit", "-q", "-m", msg]) {
+        let _ = tx.send(Err(e));
+        return;
+    }
+    let head = git(root, &["log", "-1", "--format=%h"]).unwrap_or_default();
+    let head = format!("committed {}", head.trim());
+    let upstream = git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+    let remotes = git(root, &["remote"]).unwrap_or_default();
+    let remote = remotes.lines().find(|r| *r == "origin").or_else(|| remotes.lines().next());
+    let (args, target) = match (&upstream, remote) {
+        (Ok(up), _) => (vec!["push"], up.trim().to_string()),
+        // first push of this branch: set its upstream like `git push -u` does
+        (Err(_), Some(r)) => (vec!["push", "-u", r, "HEAD"], format!("{r}/{}", branch(root))),
+        (Err(_), None) => {
+            let _ = tx.send(Ok(format!("{head} · no remote to push to")));
+            return;
+        }
+    };
+    let _ = tx.send(Ok(format!("{head} · pushing to {target}…")));
+    let _ = tx.send(Ok(match git_batch(root, &args) {
+        Ok(()) => format!("{head} · pushed to {target}"),
+        Err(e) => format!("{head} · push failed: {e}"),
+    }));
+}
+
 /// The empty tree, used as base in repositories without commits.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -164,6 +224,25 @@ fn changed_files(root: &Path, base: &str) -> Vec<(String, char)> {
         files.extend(out.split('\0').filter(|s| !s.is_empty()).map(|p| (p.to_string(), '?')));
     }
     files
+}
+
+/// Files with staged changes, mapped to whether they are fully staged
+/// (`false` when there are further unstaged changes on top).
+fn staged_files(root: &Path) -> HashMap<String, bool> {
+    let list = |args: &[&str]| -> Vec<String> {
+        git(root, args)
+            .map(|out| out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+            .unwrap_or_default()
+    };
+    let unstaged: HashSet<String> =
+        list(&["diff", "--name-only", "-z", "--no-renames"]).into_iter().collect();
+    list(&["diff", "--cached", "--name-only", "-z", "--no-renames"])
+        .into_iter()
+        .map(|p| {
+            let full = !unstaged.contains(&p);
+            (p, full)
+        })
+        .collect()
 }
 
 struct RawHunk {
@@ -632,16 +711,192 @@ enum Popup {
     None,
     Help,
     WhichKey,
+    Commit,
+}
+
+// ── Terminal modal ──────────────────────────────────────────────────────────
+
+/// Queries a program may send and wait for an answer to; vt100 doesn't
+/// answer them, so `Shell::feed` does.
+const TERM_QUERIES: [&[u8]; 4] = [b"\x1b[c", b"\x1b[0c", b"\x1b[5n", b"\x1b[6n"];
+
+/// The user's shell running on a pty, shown in a popup.
+struct Shell {
+    parser: vt100::Parser,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    visible: bool,
+}
+
+impl Shell {
+    fn spawn(dir: &Path, rows: u16, cols: u16) -> Result<Self> {
+        let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+        let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.cwd(dir);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            parser: vt100::Parser::new(rows, cols, 5000),
+            master: pair.master,
+            writer,
+            child,
+            rx,
+            visible: true,
+        })
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        loop {
+            let hit = TERM_QUERIES
+                .iter()
+                .enumerate()
+                .filter_map(|(qi, q)| rest.windows(q.len()).position(|w| w == *q).map(|at| (at, qi)))
+                .min();
+            let Some((at, qi)) = hit else { break };
+            let end = at + TERM_QUERIES[qi].len();
+            self.parser.process(&rest[..end]);
+            let reply = match qi {
+                0 | 1 => b"\x1b[?1;2c".to_vec(),
+                2 => b"\x1b[0n".to_vec(),
+                _ => {
+                    let (r, c) = self.parser.screen().cursor_position();
+                    format!("\x1b[{};{}R", r + 1, c + 1).into_bytes()
+                }
+            };
+            let _ = self.writer.write_all(&reply);
+            rest = &rest[end..];
+        }
+        self.parser.process(rest);
+        let _ = self.writer.flush();
+    }
+
+    fn send_key(&mut self, k: KeyEvent) {
+        self.parser.set_scrollback(0);
+        let bytes = key_bytes(k, self.parser.screen().application_cursor());
+        let _ = self.writer.write_all(&bytes);
+        let _ = self.writer.flush();
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        if self.parser.screen().size() != (rows, cols) {
+            self.parser.set_size(rows, cols);
+            let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        }
+    }
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.try_wait();
+    }
+}
+
+/// The bytes a terminal sends for `k`.
+fn key_bytes(k: KeyEvent, app_cursor: bool) -> Vec<u8> {
+    use KeyCode::*;
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+    // xterm modifier parameter
+    let m = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
+    let cursor = |end: char| {
+        match (m, app_cursor) {
+            (1, true) => format!("\x1bO{end}"),
+            (1, false) => format!("\x1b[{end}"),
+            _ => format!("\x1b[1;{m}{end}"),
+        }
+        .into_bytes()
+    };
+    let tilde = |n: u8| {
+        if m > 1 { format!("\x1b[{n};{m}~") } else { format!("\x1b[{n}~") }.into_bytes()
+    };
+    let mut out = match k.code {
+        Char(c) if ctrl => match c.to_ascii_lowercase() {
+            c @ 'a'..='z' => vec![c as u8 - b'a' + 1],
+            '@' | ' ' | '2' => vec![0],
+            '[' | '3' => vec![0x1b],
+            '\\' | '4' => vec![0x1c],
+            ']' | '5' => vec![0x1d],
+            '^' | '6' => vec![0x1e],
+            '_' | '/' | '7' => vec![0x1f],
+            '?' | '8' => vec![0x7f],
+            c => c.to_string().into_bytes(),
+        },
+        Char(c) => c.to_string().into_bytes(),
+        Enter => vec![b'\r'],
+        Tab => vec![b'\t'],
+        BackTab => b"\x1b[Z".to_vec(),
+        Backspace if ctrl => vec![0x08],
+        Backspace => vec![0x7f],
+        Esc => vec![0x1b],
+        Up => cursor('A'),
+        Down => cursor('B'),
+        Right => cursor('C'),
+        Left => cursor('D'),
+        Home => cursor('H'),
+        End => cursor('F'),
+        Insert => tilde(2),
+        Delete => tilde(3),
+        PageUp => tilde(5),
+        PageDown => tilde(6),
+        F(n @ 1..=4) => {
+            let end = (b'O' + n) as char;
+            if m > 1 { format!("\x1b[1;{m}{end}") } else { format!("\x1bO{end}") }.into_bytes()
+        }
+        F(n @ 5..=12) => tilde([15, 17, 18, 19, 20, 21, 23, 24][n as usize - 5]),
+        _ => Vec::new(),
+    };
+    if alt && matches!(k.code, Char(_) | Backspace | Enter) {
+        out.insert(0, 0x1b);
+    }
+    out
+}
+
+fn term_color(c: vt100::Color, default: Color) -> Color {
+    match c {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
 }
 
 struct App {
     cfg: Cfg,
+    /// Directory gitdif was started from; the terminal opens here.
+    launch_dir: PathBuf,
+    shell: Option<Shell>,
     root: PathBuf,
     base: String,
     repo_name: String,
     branch: String,
     hl: Highlighter,
     files: Vec<(String, char)>,
+    staged: HashMap<String, bool>,
     tree: Vec<Node>,
     tree_sel: usize,
     tree_scroll: usize,
@@ -652,6 +907,10 @@ struct App {
     popup: Popup,
     pending: Option<char>,
     msg: String,
+    /// Commit message being typed; kept if the popup is closed or the commit fails.
+    commit_msg: String,
+    /// Progress of a running commit & push, closed when it is done.
+    job: Option<mpsc::Receiver<Result<String>>>,
     quit: bool,
     tree_rect: Rect,
     editor_rect: Rect,
@@ -699,10 +958,13 @@ impl App {
         let mut app = App {
             branch: branch(&root),
             files: Vec::new(),
+            staged: HashMap::new(),
             tree: Vec::new(),
             hl: Highlighter::new(),
             base,
             repo_name,
+            launch_dir: cwd.clone(),
+            shell: None,
             root,
             cfg,
             tree_sel: 0,
@@ -714,6 +976,8 @@ impl App {
             popup: Popup::None,
             pending: None,
             msg: String::new(),
+            commit_msg: String::new(),
+            job: None,
             quit: false,
             tree_rect: Rect::default(),
             editor_rect: Rect::default(),
@@ -736,6 +1000,7 @@ impl App {
 
     fn reload_files(&mut self, extra: Option<&str>) {
         self.files = changed_files(&self.root, &self.base);
+        self.staged = staged_files(&self.root);
         if let Some(rel) = extra {
             if !self.files.iter().any(|f| f.0 == rel) {
                 self.files.push((rel.to_string(), ' '));
@@ -869,8 +1134,29 @@ impl App {
     fn on_key(&mut self, k: KeyEvent) {
         use KeyCode::*;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let toggle_term = ctrl && k.code == Char(':');
+        if let Some(sh) = self.shell.as_mut().filter(|s| s.visible) {
+            if toggle_term {
+                sh.visible = false;
+            } else {
+                sh.send_key(k);
+            }
+            return;
+        }
+        if toggle_term {
+            self.open_terminal();
+            return;
+        }
         if self.popup == Popup::Help {
             self.popup = Popup::None;
+            return;
+        }
+        if self.popup == Popup::Commit {
+            self.commit_key(k);
+            return;
+        }
+        if ctrl && k.code == Char('.') {
+            self.open_commit();
             return;
         }
         if let Some(p) = self.pending.take() {
@@ -883,6 +1169,8 @@ impl App {
                 (' ', Char('q')) => self.quit = true,
                 (' ', Char('r')) => self.refresh(),
                 (' ', Char('?')) => self.popup = Popup::Help,
+                (' ', Char('t')) => self.open_terminal(),
+                (' ', Char('c')) => self.open_commit(),
                 (' ', Char('x')) | (' ', Char('d')) => self.close_buf(),
                 ('g', Char('g')) => self.top(),
                 (']', Char('h' | 'c')) => self.goto_change(true),
@@ -988,11 +1276,149 @@ impl App {
         }
     }
 
+    /// Repo-relative paths of the explorer node at `i`: the file itself, or
+    /// every file under a folder.
+    fn node_paths(&self, i: usize) -> Vec<String> {
+        let Some(node) = self.tree.get(i) else { return Vec::new() };
+        if let Some((rel, _)) = &node.file {
+            return vec![rel.clone()];
+        }
+        self.tree[i + 1..]
+            .iter()
+            .take_while(|n| n.depth > node.depth)
+            .filter_map(|n| n.file.as_ref().map(|f| f.0.clone()))
+            .collect()
+    }
+
+    /// Run a git command that changes the index, then reload the explorer.
+    fn git_index(&mut self, args: &[&str], done: String) {
+        self.msg = match git(&self.root, args) {
+            Ok(_) => done,
+            Err(e) => format!("git: {e}"),
+        };
+        self.reload_files(None);
+    }
+
+    fn stage_selected(&mut self) {
+        let paths = self.node_paths(self.tree_sel);
+        if paths.is_empty() {
+            return;
+        }
+        let done = match paths.as_slice() {
+            [one] => format!("staged {one}"),
+            _ => format!("staged {} files", paths.len()),
+        };
+        let mut args = vec!["--literal-pathspecs", "add", "-A", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        self.git_index(&args, done);
+    }
+
+    fn stage_all(&mut self) {
+        self.git_index(&["add", "-A"], "staged all changes".into());
+    }
+
+    /// Unstage the file / folder under the cursor when it is fully staged,
+    /// otherwise stage all changes.
+    fn toggle_stage(&mut self) {
+        let paths = self.node_paths(self.tree_sel);
+        let staged = !paths.is_empty() && paths.iter().all(|p| self.staged.get(p) == Some(&true));
+        if !staged {
+            return self.stage_all();
+        }
+        let done = match paths.as_slice() {
+            [one] => format!("unstaged {one}"),
+            _ => format!("unstaged {} files", paths.len()),
+        };
+        let mut args = vec!["--literal-pathspecs", "reset", "-q", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        self.git_index(&args, done);
+    }
+
+    fn unstage_all(&mut self) {
+        self.git_index(&["reset", "-q"], "unstaged all changes".into());
+    }
+
+    fn open_commit(&mut self) {
+        self.popup = Popup::None;
+        if self.job.is_some() {
+            self.msg = "still busy with the last commit".into();
+            return;
+        }
+        self.staged = staged_files(&self.root);
+        if self.staged.is_empty() {
+            self.msg = "nothing staged to commit (a in the explorer stages all)".into();
+            return;
+        }
+        self.popup = Popup::Commit;
+    }
+
+    fn commit_key(&mut self, k: KeyEvent) {
+        use KeyCode::*;
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            Esc => self.popup = Popup::None,
+            Enter => self.commit(),
+            Backspace => {
+                self.commit_msg.pop();
+            }
+            Char('u') if ctrl => self.commit_msg.clear(),
+            Char('w') if ctrl => {
+                let end = self.commit_msg.trim_end().len();
+                let cut = self.commit_msg[..end].rfind(' ').map_or(0, |i| i + 1);
+                self.commit_msg.truncate(cut);
+            }
+            Char(c) if !ctrl => self.commit_msg.push(c),
+            _ => {}
+        }
+    }
+
+    /// Commit and push in the background; `pump_job` picks up the result.
+    fn commit(&mut self) {
+        let msg = self.commit_msg.trim().to_string();
+        if msg.is_empty() {
+            return;
+        }
+        self.popup = Popup::None;
+        self.msg = "committing…".into();
+        let root = self.root.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || commit_and_push(&root, &msg, &tx));
+        self.job = Some(rx);
+    }
+
+    /// Show progress of a running commit & push; true if anything changed.
+    fn pump_job(&mut self) -> bool {
+        let Some(rx) = &self.job else { return false };
+        let res = match rx.try_recv() {
+            Ok(res) => res,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.job = None;
+                return true;
+            }
+        };
+        if res.is_ok() {
+            self.commit_msg.clear();
+        }
+        // the commit moved HEAD; on a first commit there is a base now
+        self.base = resolve_base(&self.root, &self.cfg.base);
+        self.refresh();
+        self.msg = match res {
+            Ok(m) => m,
+            Err(e) => format!("commit failed: {e}"),
+        };
+        true
+    }
+
     fn tree_key(&mut self, k: KeyEvent) {
         use KeyCode::*;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let n = self.tree.len();
         match k.code {
+            Char('a') if ctrl => self.stage_all(),
+            Char('d') if ctrl => self.unstage_all(),
+            Char('a') if !ctrl => self.toggle_stage(),
+            Char('A') if !ctrl => self.stage_selected(),
             Char('j') if ctrl => self.tree_sel = (self.tree_sel + 10).min(n.saturating_sub(1)),
             Char('k') if ctrl => self.tree_sel = self.tree_sel.saturating_sub(10),
             Char('j') | Down => self.tree_sel = (self.tree_sel + 1).min(n.saturating_sub(1)),
@@ -1051,7 +1477,57 @@ impl App {
         }
     }
 
+    fn open_terminal(&mut self) {
+        self.popup = Popup::None;
+        self.pending = None;
+        if let Some(sh) = &mut self.shell {
+            sh.visible = true;
+            return;
+        }
+        // real size is set on the first draw
+        match Shell::spawn(&self.launch_dir, 24, 80) {
+            Ok(sh) => self.shell = Some(sh),
+            Err(e) => self.msg = format!("could not start terminal: {e}"),
+        }
+    }
+
+    /// Feed pending shell output to the terminal; true if anything changed.
+    fn pump_shell(&mut self) -> bool {
+        let Some(sh) = &mut self.shell else { return false };
+        let mut changed = false;
+        let mut closed = false;
+        loop {
+            match sh.rx.try_recv() {
+                Ok(bytes) => {
+                    sh.feed(&bytes);
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if closed || matches!(sh.child.try_wait(), Ok(Some(_))) {
+            self.shell = None;
+            self.msg = "terminal closed".into();
+            return true;
+        }
+        changed
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
+        if let Some(sh) = self.shell.as_mut().filter(|s| s.visible) {
+            let d: isize = match m.kind {
+                MouseEventKind::ScrollUp => 3,
+                MouseEventKind::ScrollDown => -3,
+                _ => return,
+            };
+            let n = (sh.parser.screen().scrollback() as isize + d).max(0) as usize;
+            sh.parser.set_scrollback(n);
+            return;
+        }
         let pos = ratatui::layout::Position { x: m.column, y: m.row };
         let in_tree = self.show_tree && self.tree_rect.contains(pos);
         let in_editor = self.editor_rect.contains(pos);
@@ -1110,7 +1586,11 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(area);
-        let tree_w = if self.show_tree { 32.min(area.width / 3) } else { 0 };
+        let tree_w = if self.show_tree {
+            (self.tree_width() as u16).max(32).min(area.width / 2)
+        } else {
+            0
+        };
         let [tree_a, ed_a] =
             Layout::horizontal([Constraint::Length(tree_w), Constraint::Fill(1)]).areas(mid);
         self.tree_rect = tree_a;
@@ -1128,7 +1608,122 @@ impl App {
         match self.popup {
             Popup::Help => self.draw_help(f, area),
             Popup::WhichKey => self.draw_whichkey(f, ed_a),
+            Popup::Commit => self.draw_commit(f, area),
             Popup::None => {}
+        }
+        if self.shell.as_ref().is_some_and(|s| s.visible) {
+            self.draw_terminal(f, area);
+        }
+    }
+
+    fn draw_commit(&self, f: &mut Frame, area: Rect) {
+        let w = 72.min(area.width);
+        let r = Rect {
+            x: area.x + (area.width - w) / 2,
+            y: area.y + area.height.saturating_sub(3) / 2,
+            width: w,
+            height: 3.min(area.height),
+        };
+        let n = self.staged.len();
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(BLUE))
+            .title(Span::styled(
+                format!(" Commit {n} file{} ", if n == 1 { "" } else { "s" }),
+                Style::new().fg(ORANGE).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::styled(" Enter commit & push · Esc cancel ", Style::new().fg(COMMENT)).centered())
+            .style(Style::new().bg(BG_DARK).fg(FG));
+        let inner = block.inner(r);
+        f.render_widget(Clear, r);
+        f.render_widget(block, r);
+        // show the end of a message that is wider than the box
+        let room = (inner.width as usize).saturating_sub(1);
+        let mut text = self.commit_msg.as_str();
+        while Span::raw(text).width() > room {
+            let mut it = text.chars();
+            it.next();
+            text = it.as_str();
+        }
+        let shown = Span::raw(text);
+        let x = inner.x + shown.width() as u16;
+        f.render_widget(Line::from(shown), inner);
+        if inner.height > 0 {
+            f.set_cursor_position((x, inner.y));
+        }
+    }
+
+    fn draw_terminal(&mut self, f: &mut Frame, area: Rect) {
+        let w = (area.width * 9 / 10).max(area.width.min(20));
+        let h = (area.height * 8 / 10).max(area.height.min(6));
+        let r = Rect {
+            x: area.x + (area.width - w) / 2,
+            y: area.y + (area.height - h) / 2,
+            width: w,
+            height: h,
+        };
+        let mut dir = self.launch_dir.display().to_string();
+        if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty() && dir.starts_with(h.as_str())) {
+            dir = format!("~{}", &dir[home.len()..]);
+        }
+        let Some(sh) = &mut self.shell else { return };
+        let hint = match sh.parser.screen().scrollback() {
+            0 => " Ctrl+: hide · exit to close ".to_string(),
+            n => format!(" scrolled back {n} lines · type to return "),
+        };
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(BLUE))
+            .title(Span::styled(
+                format!(" \u{f489}  Terminal  {dir} "),
+                Style::new().fg(ORANGE).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::styled(hint, Style::new().fg(COMMENT)).centered())
+            .style(Style::new().bg(BG_DARK).fg(FG));
+        let inner = block.inner(r);
+        f.render_widget(Clear, r);
+        f.render_widget(block, r);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        sh.resize(inner.height, inner.width);
+        let screen = sh.parser.screen();
+        let buf = f.buffer_mut();
+        for row in 0..inner.height {
+            for col in 0..inner.width {
+                let Some(cell) = screen.cell(row, col) else { continue };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let mut fg = term_color(cell.fgcolor(), FG);
+                let mut bg = term_color(cell.bgcolor(), BG_DARK);
+                if cell.inverse() {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                let mut style = Style::new().fg(fg).bg(bg);
+                if cell.bold() {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.italic() {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if cell.underline() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if let Some(c) = buf.cell_mut((inner.x + col, inner.y + row)) {
+                    let sym = cell.contents();
+                    c.set_symbol(if sym.is_empty() { " " } else { &sym });
+                    c.set_style(style);
+                }
+            }
+        }
+        if screen.scrollback() == 0 && !screen.hide_cursor() {
+            let (cr, cc) = screen.cursor_position();
+            if cr < inner.height && cc < inner.width {
+                f.set_cursor_position((inner.x + cc, inner.y + cr));
+            }
         }
     }
 
@@ -1169,6 +1764,30 @@ impl App {
             self.tab_cols.push(x0..(a.x + width(&spans)).min(a.right()));
         }
         f.render_widget(Line::from(spans).style(Style::new().bg(BG_DARK)), a);
+    }
+
+    /// Columns the explorer needs to show every entry without cutting it off.
+    fn tree_width(&self) -> usize {
+        let header = 4 + Span::raw(self.repo_name.as_str()).width();
+        self.tree
+            .iter()
+            .map(|n| {
+                let icon = match &n.file {
+                    None => "\u{f07c}",
+                    Some(_) => file_icon(&n.name).0,
+                };
+                // indent, icon + space, name, gap, staged marker + status, margin
+                1 + 2 * (n.depth + 1)
+                    + Span::raw(icon).width()
+                    + 1
+                    + Span::raw(n.name.as_str()).width()
+                    + 1
+                    + 2
+                    + 1
+            })
+            .chain([header])
+            .max()
+            .unwrap_or(0)
     }
 
     fn draw_tree(&mut self, f: &mut Frame, a: Rect) {
@@ -1227,10 +1846,17 @@ impl App {
             }
             let used: usize = spans.iter().map(|s| s.width()).sum();
             if !status.is_empty() {
-                let pad = w.saturating_sub(used + status.len() + 1);
-                spans.push(Span::raw(" ".repeat(pad)));
-                let st = node.file.as_ref().map(|f| f.1).unwrap_or(' ');
-                spans.push(Span::styled(status, Style::new().fg(status_color(st))));
+                let (rel, st) = node.file.as_ref().map(|f| (f.0.as_str(), f.1)).unwrap_or(("", ' '));
+                let mut right = Vec::new();
+                match self.staged.get(rel) {
+                    Some(true) => right.push(Span::styled("✓", Style::new().fg(GREEN))),
+                    Some(false) => right.push(Span::styled("✓", Style::new().fg(YELLOW))),
+                    None => {}
+                }
+                right.push(Span::styled(status, Style::new().fg(status_color(st))));
+                let rw: usize = right.iter().map(|s| s.width()).sum();
+                spans.push(Span::raw(" ".repeat(w.saturating_sub(used + rw + 1))));
+                spans.extend(right);
             }
             f.render_widget(Line::from(spans).style(Style::new().bg(bg)), row);
         }
@@ -1373,6 +1999,8 @@ impl App {
             ("e", "Explorer toggle"),
             ("r", "Refresh git state"),
             ("x", "Close buffer"),
+            ("t", "Terminal"),
+            ("c", "Commit & push"),
             ("?", "Keymaps"),
             ("q", "Quit"),
         ];
@@ -1418,8 +2046,13 @@ impl App {
             ("H / L   [b / ]b", "previous / next buffer"),
             ("Tab  C-h / C-l", "switch explorer / editor"),
             ("<Space>e", "toggle explorer"),
+            ("C-: / <Space>t", "toggle terminal"),
             ("<Space>x / C-w", "close buffer"),
             ("right-click tab", "close that buffer"),
+            ("a", "stage all / unstage file (explorer)"),
+            ("A", "stage file / folder (explorer)"),
+            ("C-a / C-d", "stage / unstage all (explorer)"),
+            ("C-. / <Space>c", "commit staged changes & push"),
             ("R", "refresh git state"),
             ("q", "quit"),
         ];
@@ -1601,12 +2234,16 @@ fn real_main() -> Result<()> {
     let mut term = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture)?;
     // Kitty keyboard protocol, so keys like Ctrl+Enter are distinguishable
-    // from their plain versions.
+    // from their plain versions, and shifted keys like Ctrl+: arrive as the
+    // character they type on the user's layout.
     let kitty_keys = supports_keyboard_enhancement().unwrap_or(false);
     if kitty_keys {
         execute!(
             io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
         )?;
     }
     let res = run(&mut app, &mut term);
@@ -1619,13 +2256,25 @@ fn real_main() -> Result<()> {
 }
 
 fn run(app: &mut App, term: &mut DefaultTerminal) -> Result<()> {
+    let mut dirty = true;
     while !app.quit {
-        term.draw(|f| app.draw(f))?;
-        match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
-            Event::Mouse(m) => app.on_mouse(m),
-            _ => {}
+        if dirty {
+            term.draw(|f| app.draw(f))?;
         }
+        // with a shell or commit running, wake up regularly to show its output
+        let busy = app.shell.is_some() || app.job.is_some();
+        let wait = if busy { Duration::from_millis(16) } else { Duration::from_secs(60) };
+        dirty = false;
+        if event::poll(wait)? {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
+                Event::Mouse(m) => app.on_mouse(m),
+                _ => {}
+            }
+            dirty = true;
+        }
+        dirty |= app.pump_shell();
+        dirty |= app.pump_job();
     }
     Ok(())
 }

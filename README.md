@@ -122,6 +122,46 @@ plain `Enter`, so use `zR` instead.
 | `<Space>e` | toggle the explorer |
 | `Enter`, `l`, `o`, click | open the file under the cursor in the explorer |
 
+### Staging (in the explorer)
+
+| Key | Action |
+|---|---|
+| `a` | stage all changes; on a file (or folder) that is already fully staged, unstage just that |
+| `A` | `git add` the file under the cursor, or every file in the folder under it |
+| `Ctrl+A` | stage all changes (`git add -A`) |
+| `Ctrl+D` | unstage all changes (`git reset`; your files are left alone) |
+
+A `✓` next to the status letter means the file is staged: green when all of
+its changes are staged, yellow when it has more changes since you staged it.
+
+### Commit & push
+
+| Key | Action |
+|---|---|
+| `Ctrl+.`, `<Space>c` | write a commit message for the staged changes |
+| `Enter` (in the popup) | `git commit`, then `git push` |
+| `Esc` (in the popup) | cancel; the message is kept for next time |
+| `Backspace`, `Ctrl+W`, `Ctrl+U` (in the popup) | delete a character / word / everything |
+
+The result shows in the message bar. A branch without an upstream is pushed to
+`origin` (or your only remote) with `-u`. Pushing can't ask for a password or
+SSH passphrase, so use an SSH agent or a git credential helper; if the push
+fails, the commit is still made and you can push from the terminal popup.
+`Ctrl+.` needs the kitty keyboard protocol (see `Ctrl+Enter` above).
+
+### Terminal
+
+| Key | Action |
+|---|---|
+| `Ctrl+:`, `<Space>t` | open a terminal popup in the folder gitdif was started from |
+| `Ctrl+:` (in the popup) | hide it; the shell keeps running and comes back on the next open |
+| `exit` | close the shell and the popup |
+| mouse wheel | scroll back through output; typing jumps back down |
+
+The popup runs your `$SHELL`. While it is open, every key goes to the shell.
+`Ctrl+:` needs the kitty keyboard protocol (see `Ctrl+Enter` above); use
+`<Space>t` to open it elsewhere. A running shell is closed when gitdif quits.
+
 ### Other
 
 | Key | Action |
