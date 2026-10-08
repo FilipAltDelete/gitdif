@@ -5,6 +5,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     io::{self, IsTerminal, Read, Write},
+    ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
@@ -29,6 +30,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
+use regex::{Regex, RegexBuilder};
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, Theme, ThemeSet},
@@ -57,6 +59,7 @@ const ADD_BG: Color = Color::Rgb(0x20, 0x30, 0x3b);
 const ADD_CUR: Color = Color::Rgb(0x2b, 0x42, 0x52);
 const DEL_BG: Color = Color::Rgb(0x37, 0x22, 0x2c);
 const DEL_CUR: Color = Color::Rgb(0x4b, 0x2a, 0x37);
+const SEARCH_BG: Color = Color::Rgb(0x3d, 0x59, 0xa1);
 
 const LOGO: &[&str] = &[
     " ██████╗ ██╗████████╗██████╗ ██╗███████╗",
@@ -288,14 +291,17 @@ fn parse_diff(out: &str) -> Vec<RawHunk> {
 /// Expand tabs, drop CRs and replace control characters so they can't break the TUI.
 fn clean(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.trim_end_matches('\r').chars() {
-        match c {
-            '\t' => out.push_str("    "),
-            c if c.is_control() => out.push('·'),
-            c => out.push(c),
-        }
-    }
+    out.extend(cleaned(s.trim_end_matches('\r')));
     out
+}
+
+/// The chars of `s` with tabs expanded and control characters replaced.
+fn cleaned(s: &str) -> impl Iterator<Item = char> + '_ {
+    s.chars().flat_map(|c| match c {
+        '\t' => std::iter::repeat_n(' ', 4),
+        c if c.is_control() => std::iter::repeat_n('·', 1),
+        c => std::iter::repeat_n(c, 1),
+    })
 }
 
 // ── Syntax highlighting ─────────────────────────────────────────────────────
@@ -707,6 +713,243 @@ fn status_color(st: char) -> Color {
     }
 }
 
+// ── Grep popup ──────────────────────────────────────────────────────────────
+
+/// Files bigger than this are not read into the search popup.
+const MAX_SEARCH_FILE: u64 = 64 << 20;
+/// Stop collecting results after this many.
+const MAX_HITS: usize = 10_000;
+/// Lines highlighted above the preview so constructs that start there
+/// (comments, strings) are colored right.
+const PREVIEW_LEAD: usize = 50;
+
+/// A changed file read into memory for searching.
+struct Doc {
+    rel: String,
+    status: char,
+    text: String,
+    /// Byte offset of each line.
+    starts: Vec<usize>,
+}
+
+impl Doc {
+    fn new(rel: String, status: char, text: String) -> Self {
+        let starts = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+            .filter(|&i| i < text.len())
+            .collect();
+        Self { rel, status, text, starts }
+    }
+
+    /// Line `i` (0-based) without its line ending.
+    fn line(&self, i: usize) -> &str {
+        let s = self.starts[i];
+        let e = self.text[s..].find('\n').map_or(self.text.len(), |n| s + n);
+        self.text[s..e].trim_end_matches('\r')
+    }
+}
+
+struct Hit {
+    doc: usize,
+    /// 0-based line of the match; None when listing files for an empty query.
+    line: Option<usize>,
+}
+
+/// State of the grep popup (Ctrl+F). The query and selection are kept when
+/// it closes; the files are read again every time it opens.
+#[derive(Default)]
+struct Search {
+    query: String,
+    docs: Vec<Doc>,
+    /// Files left out for being bigger than `MAX_SEARCH_FILE`.
+    skipped: usize,
+    re: Option<Regex>,
+    hits: Vec<Hit>,
+    /// Stopped at `MAX_HITS`.
+    capped: bool,
+    /// `hits` don't match `query` / `docs` yet.
+    stale: bool,
+    sel: usize,
+    scroll: usize,
+    /// Added lines (0-based ranges) of each doc shown in the preview.
+    added: HashMap<usize, Vec<Range<usize>>>,
+    /// Where the result rows were drawn, for mouse clicks.
+    list_rect: Rect,
+}
+
+impl Search {
+    fn load(&mut self, root: &Path, files: &[(String, char)]) {
+        self.docs.clear();
+        self.added.clear();
+        self.skipped = 0;
+        self.stale = true;
+        for (rel, st) in files {
+            let path = root.join(rel);
+            match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() && m.len() > MAX_SEARCH_FILE => self.skipped += 1,
+                Ok(m) if m.is_file() => {
+                    let Ok(raw) = std::fs::read(&path) else { continue };
+                    if raw.contains(&0) {
+                        continue;
+                    }
+                    let text = String::from_utf8(raw)
+                        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                    self.docs.push(Doc::new(rel.clone(), *st, text));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Change the query; the selection goes back to the first result.
+    fn edit(&mut self, f: impl FnOnce(&mut String)) {
+        f(&mut self.query);
+        self.stale = true;
+        self.sel = 0;
+        self.scroll = 0;
+    }
+
+    /// Recompute `hits` if the query or files changed.
+    fn update(&mut self) {
+        if !self.stale {
+            return;
+        }
+        self.stale = false;
+        self.hits.clear();
+        self.capped = false;
+        self.re = search_regex(&self.query);
+        match &self.re {
+            None => self.hits = (0..self.docs.len()).map(|doc| Hit { doc, line: None }).collect(),
+            Some(re) => 'docs: for (d, doc) in self.docs.iter().enumerate() {
+                let mut at = 0;
+                // one hit per line, like grep
+                while let Some(m) = re.find_at(&doc.text, at) {
+                    // an empty match after the final newline isn't on a line
+                    if doc.starts.is_empty() || (m.start() == doc.text.len() && doc.text.ends_with('\n')) {
+                        break;
+                    }
+                    let line = doc.starts.partition_point(|&s| s <= m.start()) - 1;
+                    if self.hits.len() == MAX_HITS {
+                        self.capped = true;
+                        break 'docs;
+                    }
+                    self.hits.push(Hit { doc: d, line: Some(line) });
+                    match doc.starts.get(line + 1) {
+                        Some(&next) => at = next,
+                        None => break,
+                    }
+                }
+            },
+        }
+        self.sel = self.sel.min(self.hits.len().saturating_sub(1));
+    }
+
+    fn move_by(&mut self, d: isize) {
+        self.update();
+        let max = self.hits.len().saturating_sub(1) as isize;
+        self.sel = (self.sel as isize + d).clamp(0, max) as usize;
+    }
+}
+
+/// Delete the last word of a text being typed, like Ctrl+W in a shell.
+fn delete_word(s: &mut String) {
+    let end = s.trim_end().len();
+    let cut = s[..end].rfind(' ').map_or(0, |i| i + 1);
+    s.truncate(cut);
+}
+
+/// Regex for a query: case-insensitive unless it has an uppercase letter,
+/// and taken literally while it isn't a valid regex (e.g. half typed).
+fn search_regex(q: &str) -> Option<Regex> {
+    if q.is_empty() {
+        return None;
+    }
+    let ignore_case = !q.chars().any(char::is_uppercase);
+    let build = |p: &str| RegexBuilder::new(p).case_insensitive(ignore_case).multi_line(true).build();
+    build(q).or_else(|_| build(&regex::escape(q))).ok()
+}
+
+/// 0-based ranges of the lines `rel` adds against `base`.
+fn added_lines(root: &Path, rel: &str, status: char, base: &str) -> Vec<Range<usize>> {
+    match status {
+        '?' => vec![0..usize::MAX],
+        ' ' => Vec::new(),
+        _ => git(root, &["diff", "--no-color", "--no-ext-diff", "-U0", base, "--", rel])
+            .map(|out| {
+                parse_diff(&out)
+                    .into_iter()
+                    .filter(|h| h.new_count > 0)
+                    .map(|h| h.new_start - 1..h.new_start - 1 + h.new_count)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Char ranges of the non-empty matches of `re` in `line`.
+fn match_ranges(re: Option<&Regex>, line: &str) -> Vec<Range<usize>> {
+    let Some(re) = re else { return Vec::new() };
+    let mut out = Vec::new();
+    let (mut byte, mut ch) = (0, 0);
+    for m in re.find_iter(line).filter(|m| !m.is_empty()) {
+        ch += line[byte..m.start()].chars().count();
+        let len = m.as_str().chars().count();
+        out.push(ch..ch + len);
+        ch += len;
+        byte = m.end();
+    }
+    out
+}
+
+/// `hl` with the chars in `marks` restyled with `st`.
+fn overlay(hl: &Hl, marks: &[Range<usize>], st: Style) -> Hl {
+    if marks.is_empty() {
+        return hl.clone();
+    }
+    let mut out: Hl = Vec::new();
+    let mut pos = 0;
+    for (style, text) in hl {
+        for c in text.chars() {
+            let style = if marks.iter().any(|r| r.contains(&pos)) { style.patch(st) } else { *style };
+            match out.last_mut() {
+                Some((s, t)) if *s == style => t.push(c),
+                _ => out.push((style, c.to_string())),
+            }
+            pos += 1;
+        }
+    }
+    out
+}
+
+/// Columns of the first match of `re` in `line` once it is cleaned.
+fn first_match(re: Option<&Regex>, line: &str) -> Option<Range<usize>> {
+    let m = re?.find(line)?;
+    let start = cleaned(&line[..m.start()]).count();
+    Some(start..start + cleaned(m.as_str()).count())
+}
+
+/// Up to `room` columns of a matched line for the result list, starting a
+/// little before the first match when it would be cut off.
+fn hit_text(text: &str, re: Option<&Regex>, room: usize) -> Vec<Span<'static>> {
+    let text = text.trim_start();
+    let skip = match first_match(re, text) {
+        Some(m) if m.end > room => m.start.saturating_sub(room / 4),
+        _ => 0,
+    };
+    let mut spans = Vec::new();
+    let mut room = room;
+    if skip > 0 && room > 0 {
+        spans.push(Span::styled("…", Style::new().fg(COMMENT)));
+        room -= 1;
+    }
+    let line: String = cleaned(text).skip(skip).take(room).collect();
+    let marks = match_ranges(re, &line);
+    let base = Style::new().fg(FG_DARK);
+    let hl = overlay(&vec![(base, line)], &marks, Style::new().fg(ORANGE).add_modifier(Modifier::BOLD));
+    spans.extend(slice_spans(&hl, 0, room));
+    spans
+}
+
 // ── App ─────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
@@ -721,6 +964,7 @@ enum Popup {
     Help,
     WhichKey,
     Commit,
+    Search,
 }
 
 // ── Terminal modal ──────────────────────────────────────────────────────────
@@ -920,6 +1164,7 @@ struct App {
     commit_msg: String,
     /// Progress of a running commit & push, closed when it is done.
     job: Option<mpsc::Receiver<JobMsg>>,
+    search: Search,
     quit: bool,
     /// Printed to the shell after quitting.
     exit_msg: Option<String>,
@@ -989,6 +1234,7 @@ impl App {
             msg: String::new(),
             commit_msg: String::new(),
             job: None,
+            search: Search::default(),
             quit: false,
             exit_msg: None,
             tree_rect: Rect::default(),
@@ -1167,8 +1413,16 @@ impl App {
             self.commit_key(k);
             return;
         }
+        if self.popup == Popup::Search {
+            self.search_key(k);
+            return;
+        }
         if ctrl && k.code == Char('.') {
             self.open_commit();
+            return;
+        }
+        if ctrl && k.code == Char('f') {
+            self.open_search();
             return;
         }
         if let Some(p) = self.pending.take() {
@@ -1183,6 +1437,7 @@ impl App {
                 (' ', Char('?')) => self.popup = Popup::Help,
                 (' ', Char('t')) => self.open_terminal(),
                 (' ', Char('c')) => self.open_commit(),
+                (' ', Char('/')) => self.open_search(),
                 (' ', Char('x')) | (' ', Char('d')) => self.close_buf(),
                 ('g', Char('g')) => self.top(),
                 (']', Char('h' | 'c')) => self.goto_change(true),
@@ -1374,14 +1629,72 @@ impl App {
                 self.commit_msg.pop();
             }
             Char('u') if ctrl => self.commit_msg.clear(),
-            Char('w') if ctrl => {
-                let end = self.commit_msg.trim_end().len();
-                let cut = self.commit_msg[..end].rfind(' ').map_or(0, |i| i + 1);
-                self.commit_msg.truncate(cut);
-            }
+            Char('w') if ctrl => delete_word(&mut self.commit_msg),
             Char(c) if !ctrl => self.commit_msg.push(c),
             _ => {}
         }
+    }
+
+    fn open_search(&mut self) {
+        self.popup = Popup::Search;
+        self.pending = None;
+        let files: Vec<(String, char)> = self.tree.iter().filter_map(|n| n.file.clone()).collect();
+        self.search.load(&self.root, &files);
+    }
+
+    fn search_key(&mut self, k: KeyEvent) {
+        use KeyCode::*;
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let s = &mut self.search;
+        let page = s.list_rect.height.max(1) as isize;
+        match k.code {
+            Esc => self.popup = Popup::None,
+            Char('f') if ctrl => self.popup = Popup::None,
+            Enter => self.open_hit(),
+            Down => s.move_by(1),
+            Up => s.move_by(-1),
+            Char('j' | 'n') if ctrl => s.move_by(1),
+            Char('k' | 'p') if ctrl => s.move_by(-1),
+            PageDown => s.move_by(page),
+            PageUp => s.move_by(-page),
+            Backspace if !s.query.is_empty() => s.edit(|q| {
+                q.pop();
+            }),
+            Char('u') if ctrl => s.edit(String::clear),
+            Char('w') if ctrl => s.edit(delete_word),
+            Char(c) if !ctrl => s.edit(|q| q.push(c)),
+            _ => {}
+        }
+    }
+
+    /// Open the selected search result with the cursor on its line.
+    fn open_hit(&mut self) {
+        self.search.update();
+        let Some(hit) = self.search.hits.get(self.search.sel) else { return };
+        let (rel, line) = (self.search.docs[hit.doc].rel.clone(), hit.line);
+        self.popup = Popup::None;
+        self.open(&rel);
+        if let Some(line) = line {
+            self.goto_line(line);
+        }
+    }
+
+    /// Put the cursor on 0-based `line` of the current buffer, opening the
+    /// hidden lines around it.
+    fn goto_line(&mut self, line: usize) {
+        let (edge, ctx, h) = (self.cfg.edge, self.cfg.ctx, self.editor_h());
+        let Some(b) = self.bufs.get_mut(self.cur) else { return };
+        let find = |b: &FileView| {
+            b.rows.iter().position(|r| match r.src {
+                Src::Line(i) => i == line,
+                Src::Fold(s, c) => (s..s + c).contains(&(line + 1)),
+                Src::Del(..) => false,
+            })
+        };
+        let Some(row) = find(b) else { return };
+        b.cursor = row;
+        let row = if b.open_fold(edge, ctx) { find(b).unwrap_or(b.cursor) } else { row };
+        b.jump(row, h);
     }
 
     /// Commit and push in the background; `pump_job` picks up the result.
@@ -1483,7 +1796,6 @@ impl App {
             Char('k') | Up => b.move_by(-1),
             Char('d') if ctrl => b.move_by(h / 2),
             Char('u') if ctrl => b.move_by(-h / 2),
-            Char('f') if ctrl => b.move_by(h),
             Char('b') if ctrl => b.move_by(-h),
             PageDown => b.move_by(h),
             PageUp => b.move_by(-h),
@@ -1548,6 +1860,25 @@ impl App {
             return;
         }
         let pos = ratatui::layout::Position { x: m.column, y: m.row };
+        if self.popup == Popup::Search {
+            let s = &mut self.search;
+            match m.kind {
+                MouseEventKind::ScrollDown => s.move_by(3),
+                MouseEventKind::ScrollUp => s.move_by(-3),
+                // click selects; clicking the selected result opens it
+                MouseEventKind::Down(MouseButton::Left) if s.list_rect.contains(pos) => {
+                    s.update();
+                    let i = s.scroll + (m.row - s.list_rect.y) as usize;
+                    if i == s.sel {
+                        self.open_hit();
+                    } else if i < s.hits.len() {
+                        s.sel = i;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let in_tree = self.show_tree && self.tree_rect.contains(pos);
         let in_editor = self.editor_rect.contains(pos);
         match m.kind {
@@ -1628,6 +1959,7 @@ impl App {
             Popup::Help => self.draw_help(f, area),
             Popup::WhichKey => self.draw_whichkey(f, ed_a),
             Popup::Commit => self.draw_commit(f, area),
+            Popup::Search => self.draw_search(f, area),
             Popup::None => {}
         }
         if self.shell.as_ref().is_some_and(|s| s.visible) {
@@ -1670,6 +2002,218 @@ impl App {
         f.render_widget(Line::from(shown), inner);
         if inner.height > 0 {
             f.set_cursor_position((x, inner.y));
+        }
+    }
+
+    fn draw_search(&mut self, f: &mut Frame, area: Rect) {
+        self.search.update();
+        let w = (area.width * 9 / 10).max(area.width.min(40));
+        let h = (area.height * 85 / 100).max(area.height.min(10));
+        let r = Rect {
+            x: area.x + (area.width - w) / 2,
+            y: area.y + (area.height - h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, r);
+        f.render_widget(Block::new().style(Style::new().bg(BG)), r);
+        // no room for a preview on narrow screens
+        if w < 80 {
+            return self.draw_search_list(f, r);
+        }
+        let [list, preview] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).spacing(1).areas(r);
+        self.draw_search_list(f, list);
+        self.draw_search_preview(f, preview);
+    }
+
+    fn draw_search_list(&mut self, f: &mut Frame, a: Rect) {
+        let s = &mut self.search;
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(BLUE))
+            .title(Span::styled(
+                " \u{f002}  Grep changed files ",
+                Style::new().fg(ORANGE).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(
+                Line::styled(" C-j/C-k select · Enter open · Esc close ", Style::new().fg(COMMENT)).centered(),
+            )
+            .style(Style::new().bg(BG_DARK).fg(FG));
+        let inner = block.inner(a);
+        f.render_widget(block, a);
+        s.list_rect = Rect::default();
+        if inner.height < 3 || inner.width < 8 {
+            return;
+        }
+
+        // prompt, with the result count on the right
+        let n = s.hits.len();
+        let mut count = match (n, s.query.is_empty()) {
+            (0, true) => "0 files".to_string(),
+            (0, false) => "0 matches".to_string(),
+            _ => format!("{}/{n}{}", s.sel + 1, if s.capped { "+" } else { "" }),
+        };
+        if s.skipped > 0 {
+            count.push_str(&format!(" · {} too big to search", s.skipped));
+        }
+        let prompt = Span::styled("❯ ", Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
+        let mut room = (inner.width as usize).saturating_sub(prompt.width() + 1);
+        let count_w = Span::raw(&count).width() + 2;
+        let show_count = room >= count_w + 10;
+        if show_count {
+            room -= count_w;
+        }
+        // show the end of a query that is wider than the box
+        let mut q = s.query.as_str();
+        while Span::raw(q).width() > room {
+            let mut it = q.chars();
+            it.next();
+            q = it.as_str();
+        }
+        let q = Span::styled(q, Style::new().fg(FG));
+        let x = inner.x + (prompt.width() + q.width()) as u16;
+        let mut spans = vec![prompt, q];
+        if show_count {
+            let used: usize = spans.iter().map(Span::width).sum();
+            spans.push(Span::raw(" ".repeat((inner.width as usize).saturating_sub(used + count_w - 1))));
+            spans.push(Span::styled(count, Style::new().fg(COMMENT)));
+        }
+        f.render_widget(Line::from(spans), Rect { height: 1, ..inner });
+        f.set_cursor_position((x, inner.y));
+        let sep = format!("├{}┤", "─".repeat((a.width as usize).saturating_sub(2)));
+        f.render_widget(Line::styled(sep, Style::new().fg(BLUE)), Rect { y: inner.y + 1, height: 1, ..a });
+
+        let list = Rect { y: inner.y + 2, height: inner.height - 2, ..inner };
+        s.list_rect = list;
+        let lh = list.height as usize;
+        if s.sel < s.scroll {
+            s.scroll = s.sel;
+        } else if s.sel >= s.scroll + lh {
+            s.scroll = s.sel + 1 - lh;
+        }
+        s.scroll = s.scroll.min(n.saturating_sub(lh));
+        if n == 0 {
+            let msg = if s.docs.is_empty() { "  no changed files" } else { "  no matches" };
+            f.render_widget(Line::styled(msg, Style::new().fg(COMMENT)), Rect { height: 1, ..list });
+        }
+        let w = list.width as usize;
+        for (k, hit) in s.hits.iter().enumerate().skip(s.scroll).take(lh) {
+            let doc = &s.docs[hit.doc];
+            let sel = k == s.sel;
+            let (dir, name) = match doc.rel.rsplit_once('/') {
+                Some((d, name)) => (format!("{d}/"), name),
+                None => (String::new(), doc.rel.as_str()),
+            };
+            let (icon, ic) = file_icon(name);
+            let mut ns = Style::new().fg(FG);
+            if sel {
+                ns = ns.add_modifier(Modifier::BOLD);
+            }
+            let mut spans = vec![
+                Span::styled(if sel { "▎" } else { " " }, Style::new().fg(BLUE)),
+                Span::styled(format!("{icon} "), Style::new().fg(ic)),
+                Span::styled(dir, Style::new().fg(COMMENT)),
+                Span::styled(name.to_string(), ns),
+            ];
+            match hit.line {
+                Some(l) => {
+                    spans.push(Span::styled(format!(":{}  ", l + 1), Style::new().fg(DARK3)));
+                    let used: usize = spans.iter().map(Span::width).sum();
+                    spans.extend(hit_text(doc.line(l), s.re.as_ref(), w.saturating_sub(used + 1)));
+                }
+                None => {
+                    // status letter on the right, like in the explorer
+                    let st = match doc.status {
+                        '?' => "U".to_string(),
+                        ' ' => String::new(),
+                        c => c.to_string(),
+                    };
+                    let used: usize = spans.iter().map(Span::width).sum();
+                    spans.push(Span::raw(" ".repeat(w.saturating_sub(used + st.len() + 1))));
+                    spans.push(Span::styled(st, Style::new().fg(status_color(doc.status))));
+                }
+            }
+            let row = Rect { y: list.y + (k - s.scroll) as u16, height: 1, ..list };
+            let bg = if sel { BG_HL } else { BG_DARK };
+            f.render_widget(Line::from(spans).style(Style::new().bg(bg)), row);
+        }
+    }
+
+    /// The selected result's file around the matched line.
+    fn draw_search_preview(&mut self, f: &mut Frame, a: Rect) {
+        let s = &mut self.search;
+        let hit = s.hits.get(s.sel);
+        let title = match hit {
+            Some(hit) => {
+                let rel = &s.docs[hit.doc].rel;
+                format!(" {} {rel} ", file_icon(rel.rsplit('/').next().unwrap_or(rel)).0)
+            }
+            None => " Preview ".to_string(),
+        };
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(BLUE))
+            .title(Line::styled(title, Style::new().fg(CYAN).add_modifier(Modifier::BOLD)).centered())
+            .style(Style::new().bg(BG_DARK).fg(FG));
+        let inner = block.inner(a);
+        f.render_widget(block, a);
+        let Some(hit) = hit else { return };
+        let doc = &s.docs[hit.doc];
+        let n = doc.starts.len();
+        if n == 0 {
+            let r = Rect { y: inner.y + inner.height / 2, height: 1, ..inner };
+            f.render_widget(Line::styled("empty file", Style::new().fg(COMMENT)).centered(), r);
+            return;
+        }
+        let added = s.added.entry(hit.doc).or_insert_with(|| added_lines(&self.root, &doc.rel, doc.status, &self.base));
+        let h = inner.height as usize;
+        let nw = n.to_string().len().max(3);
+        let text_w = (inner.width as usize).saturating_sub(nw + 4);
+        let scroll = hit.line.map_or(0, |l| l.saturating_sub(h / 3)).min(n.saturating_sub(h));
+        // scroll right when the match is past the right edge
+        let hscroll = match hit.line.and_then(|l| first_match(s.re.as_ref(), doc.line(l))) {
+            Some(m) if m.end > text_w => m.start.saturating_sub(text_w / 4),
+            _ => 0,
+        };
+
+        // only the visible part of each line is cleaned and highlighted, so
+        // huge files and very long lines stay fast; the lines above only
+        // help coloring when lines are shown from their start
+        let lead = if hscroll == 0 { scroll.saturating_sub(PREVIEW_LEAD) } else { scroll };
+        let end = (scroll + h).min(n);
+        let text: Vec<String> =
+            (lead..end).map(|i| cleaned(doc.line(i)).skip(hscroll).take(text_w).collect()).collect();
+        let syn = self.hl.syntax_for(Path::new(&doc.rel), doc.line(0));
+        let hls = self.hl.run(syn, &text);
+        for i in scroll..end {
+            let cur = hit.line == Some(i);
+            let add = added.iter().any(|r| r.contains(&i));
+            let bg = match (add, cur) {
+                (true, true) => ADD_CUR,
+                (true, false) => ADD_BG,
+                (false, true) => BG_HL,
+                (false, false) => BG_DARK,
+            };
+            let mark = if cur { Style::new().bg(ORANGE).fg(BG_DARK) } else { Style::new().bg(SEARCH_BG).fg(FG) };
+            let hl = overlay(&hls[i - lead], &match_ranges(s.re.as_ref(), &text[i - lead]), mark);
+            let num_style = if cur {
+                Style::new().fg(ORANGE).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(GUTTER)
+            };
+            let mut spans = vec![
+                Span::raw(" "),
+                Span::styled(format!("{:>nw$}", i + 1), num_style),
+                Span::raw(" "),
+                Span::styled(if add { "▎" } else { " " }, Style::new().fg(GREEN)),
+                Span::raw(" "),
+            ];
+            spans.extend(slice_spans(&hl, 0, text_w));
+            let row = Rect { y: inner.y + (i - scroll) as u16, height: 1, ..inner };
+            f.render_widget(Line::from(spans).style(Style::new().bg(bg)), row);
         }
     }
 
@@ -1998,7 +2542,7 @@ impl App {
     fn draw_cmdline(&self, f: &mut Frame, a: Rect) {
         let msg = if self.msg.is_empty() {
             Span::styled(
-                "]h/[h next/prev change · <Enter>/l/click open fold · +/- context · <Space>e explorer · ? help",
+                "]h/[h next/prev change · <Enter>/l/click open fold · +/- context · <Space>e explorer · C-f grep · ? help",
                 Style::new().fg(DARK3),
             )
         } else {
@@ -2020,6 +2564,7 @@ impl App {
             ("x", "Close buffer"),
             ("t", "Terminal"),
             ("c", "Commit & push"),
+            ("/", "Grep changed files"),
             ("?", "Keymaps"),
             ("q", "Quit"),
         ];
@@ -2072,6 +2617,7 @@ impl App {
             ("A", "stage file / folder (explorer)"),
             ("C-a / C-d", "stage / unstage all (explorer)"),
             ("C-. / <Space>c", "commit staged changes & push"),
+            ("C-f / <Space>/", "grep changed files"),
             ("R", "refresh git state"),
             ("q", "quit"),
         ];
@@ -2288,10 +2834,17 @@ fn run(app: &mut App, term: &mut DefaultTerminal) -> Result<()> {
         let wait = if busy { Duration::from_millis(16) } else { Duration::from_secs(60) };
         dirty = false;
         if event::poll(wait)? {
-            match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
-                Event::Mouse(m) => app.on_mouse(m),
-                _ => {}
+            // handle everything already queued before drawing again, so fast
+            // typing in the grep popup runs one search, not one per key
+            loop {
+                match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
+                    Event::Mouse(m) => app.on_mouse(m),
+                    _ => {}
+                }
+                if app.quit || !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
             dirty = true;
         }

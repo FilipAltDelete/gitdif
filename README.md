@@ -92,7 +92,7 @@ Press `?` inside gitdif for this list, or `<Space>` for the leader menu.
 | `j` / `k` | down / up |
 | `Ctrl+J` / `Ctrl+K` | 10 lines down / up |
 | `Ctrl+D` / `Ctrl+U` | half page down / up |
-| `Ctrl+F` / `Ctrl+B`, `PgDn` / `PgUp` | page down / up |
+| `PgDn` / `PgUp` | page down / up (`Ctrl+B` also pages up) |
 | `gg` / `G` | top / bottom |
 | `]h` / `[h`, `n` / `N` | next / previous change |
 | `h` / `l`, `0` | scroll left / right, reset |
@@ -148,6 +148,25 @@ The result shows in the message bar. A branch without an upstream is pushed to
 SSH passphrase, so use an SSH agent or a git credential helper; if the push
 fails, the commit is still made and you can push from the terminal popup.
 `Ctrl+.` needs the kitty keyboard protocol (see `Ctrl+Enter` above).
+
+### Search
+
+| Key | Action |
+|---|---|
+| `Ctrl+F`, `<Space>/` | grep every changed and untracked file |
+| type | search; lowercase ignores case, any uppercase letter makes it match case |
+| `↑` / `↓`, `Ctrl+J` / `Ctrl+K`, `Ctrl+N` / `Ctrl+P` | previous / next result |
+| `PgUp` / `PgDn` | a page of results up / down |
+| click | select a result; click it again to open it |
+| `Enter` | open the file at the matching line (hidden lines around it are opened) |
+| `Backspace`, `Ctrl+W`, `Ctrl+U` | delete a character / word / everything |
+| `Esc`, `Ctrl+F` | close; the search and selection are kept for next time |
+
+The query is a regular expression; while it isn't a valid one (say `foo(`
+half typed) it is matched as plain text. With an empty query the popup lists
+the changed files. The right side previews the file around the selected match,
+with added lines marked green. Binary files and files over 64 MB are not
+searched, and results stop at 10,000.
 
 ### Terminal
 
